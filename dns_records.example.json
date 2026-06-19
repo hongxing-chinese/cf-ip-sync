@@ -1,0 +1,18 @@
+{
+  "records": [
+    {
+      "name": "example.com",
+      "zone_id": "your_first_zone_id",
+      "recordset_id": "your_first_recordset_id",
+      "type": "A",
+      "ttl": 300
+    },
+    {
+      "name": "www.example.net",
+      "zone_id": "your_second_zone_id",
+      "recordset_id": "your_second_recordset_id",
+      "type": "A",
+      "ttl": 300
+    }
+  ]
+}
