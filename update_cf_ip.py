@@ -65,6 +65,13 @@ HUAWEI_REGION = os.environ.get("HUAWEI_REGION", "ap-southeast-1")
 # 飞书 Webhook 使用本项目独立变量名。
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL_CFST", "")
 
+IP_SOURCE = os.environ.get("IP_SOURCE", "cfhub").strip().lower()
+CFHUB_POOLS_URL = os.environ.get(
+    "CFHUB_POOLS_URL", "https://cfhub.1molchuan.top/api/v1/pools"
+)
+CFHUB_MAX_LATENCY_MS = env_int("CFHUB_MAX_LATENCY_MS", 500)
+CFHUB_UPDATE_INTERVAL_SECONDS = env_int("CFHUB_UPDATE_INTERVAL_SECONDS", 300)
+
 DNS_ZONE_ID = os.environ.get("DNS_ZONE_ID", "")
 DNS_RECORDSET_ID = os.environ.get("DNS_RECORDSET_ID", "")
 DNS_RECORD_NAME = os.environ.get("DNS_RECORD_NAME", "")
@@ -311,6 +318,9 @@ def normalize_dns_record(item, index):
         "recordset_id": str(item.get("recordset_id") or item.get("id") or "").strip(),
         "type": str(item.get("type") or DNS_RECORD_TYPE).strip().upper(),
         "ttl": int(item.get("ttl") or DNS_TTL),
+        "cfhub_line": normalize_cfhub_line(
+            item.get("cfhub_line") or item.get("line") or "cloud", index
+        ),
     }
 
     missing = [
@@ -324,13 +334,26 @@ def normalize_dns_record(item, index):
     if record["type"] not in {"A", "AAAA"}:
         raise ValueError(f"第 {index} 条 DNS 记录配置的 type 必须是 A 或 AAAA。")
 
-    if record["type"] != DNS_RECORD_TYPE:
-        raise ValueError(
-            f"第 {index} 条 DNS 记录类型为 {record['type']}，"
-            f"但本次 CFST 结果类型为 {DNS_RECORD_TYPE}，请保持一致。"
-        )
-
     return record
+
+
+CFHUB_LINES = {
+    "cmcc": "cmcc", "mobile": "cmcc", "移动": "cmcc",
+    "cernet": "cernet", "教育网": "cernet",
+    "cloud": "cloud", "default": "cloud", "全网默认": "cloud",
+    "chinanet": "chinanet", "telecom": "chinanet", "电信": "chinanet",
+    "unicom": "unicom", "联通": "unicom",
+}
+
+
+def normalize_cfhub_line(value, index):
+    line = str(value).strip().lower()
+    if line not in CFHUB_LINES:
+        raise ValueError(
+            f"第 {index} 条 DNS 记录线路 {value!r} 无法识别；"
+            "请使用 cmcc、cernet、cloud、chinanet 或 unicom。"
+        )
+    return CFHUB_LINES[line]
 
 
 def validate_config():
@@ -340,8 +363,14 @@ def validate_config():
     if not SK:
         missing.append("HUAWEI_SK")
 
+    if IP_SOURCE not in {"cfhub", "cfst"}:
+        raise ValueError("IP_SOURCE 必须是 cfhub 或 cfst")
     if DNS_RECORD_TYPE not in {"A", "AAAA"}:
         raise ValueError("DNS_RECORD_TYPE 必须是 A 或 AAAA")
+    if CFHUB_UPDATE_INTERVAL_SECONDS <= 0:
+        raise ValueError("CFHUB_UPDATE_INTERVAL_SECONDS 必须大于 0")
+    if CFHUB_MAX_LATENCY_MS < 0:
+        raise ValueError("CFHUB_MAX_LATENCY_MS 不能小于 0")
 
     if missing and not DRY_RUN:
         raise ValueError("缺少必要的环境变量：" + ", ".join(missing))
@@ -366,7 +395,8 @@ def update_single_huawei_dns(client, record, ips):
     request.body = UpdateRecordSetReq(records=ips, ttl=record["ttl"])
 
     client.update_record_set(request)
-    print(f"  成功：{record['name']} {record['type']} -> {ips}")
+    line_detail = f" 线路={record['cfhub_line']}" if record.get("cfhub_line") else ""
+    print(f"  成功：{record['name']} {record['type']}{line_detail} -> {ips}")
     return {
         "name": record["name"],
         "type": record["type"],
@@ -422,6 +452,164 @@ def update_huawei_dns_records(records, ips):
     return results
 
 
+# ================= CFHub 数据源 =================
+
+
+def fetch_cfhub_ips():
+    request = urllib.request.Request(
+        CFHUB_POOLS_URL, headers={"User-Agent": "cf-ip-sync/1.0"}
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    pools = payload.get("pools") if isinstance(payload, dict) else None
+    if not isinstance(pools, list):
+        raise ValueError("CFHub API 响应缺少 pools 数组。")
+
+    selected = {}
+    supported_lines = set(CFHUB_LINES.values())
+    for pool in pools:
+        if not isinstance(pool, dict) or pool.get("isp") != "national":
+            continue
+        if pool.get("published") is False:
+            continue
+        entries = pool.get("ips", [])
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                latency = float(entry.get("median_ms"))
+                ip_obj = ipaddress.ip_address(str(entry.get("ip", "")).strip())
+            except (TypeError, ValueError):
+                continue
+            if latency > CFHUB_MAX_LATENCY_MS:
+                continue
+            record_type = "A" if ip_obj.version == 4 else "AAAA"
+            lines = entry.get("lines", [])
+            if not isinstance(lines, list):
+                continue
+            for line in lines:
+                if line not in supported_lines:
+                    continue
+                key = (line, record_type)
+                selected.setdefault(key, {})[str(ip_obj)] = {
+                    "ip": str(ip_obj),
+                    "latency_ms": latency,
+                    "votes": entry.get("votes", ""),
+                    "users": entry.get("users", ""),
+                    "lines": lines,
+                }
+
+    result = {key: list(items.values()) for key, items in selected.items()}
+    if not result:
+        raise RuntimeError(
+            f"CFHub national 池中没有 median_ms <= {CFHUB_MAX_LATENCY_MS} 的有效 IP。"
+        )
+    return result
+
+
+def update_cfhub_dns_records(records, ips_by_line_type):
+    """按 CFHub 线路及地址族更新华为云上预先创建的记录集。"""
+    applicable = []
+    results = []
+    for record in records:
+        items = ips_by_line_type.get((record["cfhub_line"], record["type"]), [])
+        ips = [item["ip"] for item in items]
+        if not ips:
+            print(
+                f"  跳过：{record['name']} {record['type']} "
+                f"线路={record['cfhub_line']}，CFHub 当前没有符合条件的 IP；保留现有解析。"
+            )
+            results.append(
+                {
+                    "name": record["name"], "type": record["type"],
+                    "line": record["cfhub_line"], "status": "跳过", "records": [],
+                    "error": "该线路和地址族当前没有符合条件的 IP，已保留现有解析。",
+                }
+            )
+        else:
+            applicable.append((record, items))
+
+    if DRY_RUN:
+        print("\nDRY_RUN=true，跳过华为云 DNS 更新：")
+        for record, items in applicable:
+            ips = [item["ip"] for item in items]
+            print(
+                f"  演练：{record['name']} {record['type']} "
+                f"线路={record['cfhub_line']} -> {ips}"
+            )
+            results.append(
+                {
+                    "name": record["name"], "type": record["type"],
+                    "line": record["cfhub_line"],
+                    "status": "演练", "records": ips, "error": "",
+                }
+            )
+        return results
+
+    credentials = BasicCredentials(AK, SK)
+    client = (
+        DnsClient.new_builder()
+        .with_credentials(credentials)
+        .with_region(DnsRegion.value_of(HUAWEI_REGION))
+        .build()
+    )
+    print("\n开始同步华为云 DNS 记录：")
+    for record, items in applicable:
+        ips = [item["ip"] for item in items]
+        try:
+            result = update_single_huawei_dns(client, record, ips)
+            result["line"] = record["cfhub_line"]
+            results.append(result)
+        except Exception as exc:
+            error = str(exc)
+            print(
+                f"  失败：{record['name']} {record['type']} "
+                f"线路={record['cfhub_line']}，错误：{error}"
+            )
+            results.append(
+                {
+                    "name": record["name"], "type": record["type"],
+                    "status": "失败", "records": ips, "error": error,
+                }
+            )
+    return results
+
+
+def run_cfhub_cycle(dns_records):
+    print(f"\n正在从 CFHub 获取全国 IP 池：{CFHUB_POOLS_URL}")
+    ips_by_line_type = fetch_cfhub_ips()
+    selected_rows = [item for items in ips_by_line_type.values() for item in items]
+    for (line, record_type), items in sorted(ips_by_line_type.items()):
+        details = ", ".join(
+            f"{item['ip']} ({item['latency_ms']:g} ms)" for item in items
+        )
+        print(f"  {line} {record_type}: {details}")
+    results = update_cfhub_dns_records(dns_records, ips_by_line_type)
+    failed = any(result["status"] == "失败" for result in results)
+    status = "dry_run" if DRY_RUN else ("failed" if failed else "success")
+    send_feishu_notification(status, selected_rows, results)
+    return 1 if failed else 0
+
+
+def run_cfhub_forever(dns_records):
+    print(
+        f"CFHub 自动更新已启动，每 {CFHUB_UPDATE_INTERVAL_SECONDS} 秒获取并同步一次。"
+    )
+    while True:
+        started = time.monotonic()
+        try:
+            run_cfhub_cycle(dns_records)
+        except Exception as exc:
+            error = str(exc)
+            print(f"\n本轮 CFHub 同步失败：{error}")
+            send_feishu_notification("failed", [], [], error=error)
+        elapsed = time.monotonic() - started
+        time.sleep(max(0, CFHUB_UPDATE_INTERVAL_SECONDS - elapsed))
+
+
 # ================= 飞书通知 =================
 
 
@@ -434,11 +622,11 @@ def send_feishu_notification(status, selected_rows, update_results=None, error="
     detail_lines = []
     for item in selected_rows:
         line = item["ip"]
-        if item["latency_ms"]:
+        if item.get("latency_ms") not in (None, ""):
             line += f" | 延迟 {item['latency_ms']} ms"
-        if item["speed_mb_s"]:
+        if item.get("speed_mb_s"):
             line += f" | 速度 {item['speed_mb_s']} MB/s"
-        if item["colo"]:
+        if item.get("colo"):
             line += f" | 机房 {item['colo']}"
         detail_lines.append(line)
 
@@ -452,6 +640,8 @@ def send_feishu_notification(status, selected_rows, update_results=None, error="
     result_lines = []
     for result in update_results:
         line = f"{result['status']}：{result['name']} {result['type']}"
+        if result.get("line"):
+            line += f"（{result['line']}）"
         if result.get("error"):
             line += f" | {result['error']}"
         result_lines.append(line)
@@ -532,6 +722,15 @@ def main():
     update_results = []
     try:
         dns_records = validate_config()
+        if IP_SOURCE == "cfhub":
+            run_cfhub_forever(dns_records)
+            return 0
+
+        dns_records = [record for record in dns_records if record["type"] == DNS_RECORD_TYPE]
+        if not dns_records:
+            raise ValueError(
+                f"配置文件中没有 type={DNS_RECORD_TYPE} 的 DNS 记录，无法写入本地测速结果。"
+            )
         selected_rows = run_cfst()
         ips = [item["ip"] for item in selected_rows]
         update_results = update_huawei_dns_records(dns_records, ips)

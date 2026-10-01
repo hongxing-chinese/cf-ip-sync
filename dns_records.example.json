@@ -1,17 +1,83 @@
 {
   "records": [
     {
-      "name": "example.com",
-      "zone_id": "your_first_zone_id",
-      "recordset_id": "your_first_recordset_id",
+      "name": "cdn.example.com",
+      "zone_id": "your_zone_id",
+      "recordset_id": "cmcc_a_recordset_id",
       "type": "A",
+      "line": "cmcc",
       "ttl": 300
     },
     {
-      "name": "www.example.net",
-      "zone_id": "your_second_zone_id",
-      "recordset_id": "your_second_recordset_id",
+      "name": "cdn.example.com",
+      "zone_id": "your_zone_id",
+      "recordset_id": "cmcc_aaaa_recordset_id",
+      "type": "AAAA",
+      "line": "cmcc",
+      "ttl": 300
+    },
+    {
+      "name": "cdn.example.com",
+      "zone_id": "your_zone_id",
+      "recordset_id": "chinanet_a_recordset_id",
       "type": "A",
+      "line": "chinanet",
+      "ttl": 300
+    },
+    {
+      "name": "cdn.example.com",
+      "zone_id": "your_zone_id",
+      "recordset_id": "chinanet_aaaa_recordset_id",
+      "type": "AAAA",
+      "line": "chinanet",
+      "ttl": 300
+    },
+    {
+      "name": "cdn.example.com",
+      "zone_id": "your_zone_id",
+      "recordset_id": "unicom_a_recordset_id",
+      "type": "A",
+      "line": "unicom",
+      "ttl": 300
+    },
+    {
+      "name": "cdn.example.com",
+      "zone_id": "your_zone_id",
+      "recordset_id": "unicom_aaaa_recordset_id",
+      "type": "AAAA",
+      "line": "unicom",
+      "ttl": 300
+    },
+    {
+      "name": "cdn.example.com",
+      "zone_id": "your_zone_id",
+      "recordset_id": "cernet_a_recordset_id",
+      "type": "A",
+      "line": "cernet",
+      "ttl": 300
+    },
+    {
+      "name": "cdn.example.com",
+      "zone_id": "your_zone_id",
+      "recordset_id": "cernet_aaaa_recordset_id",
+      "type": "AAAA",
+      "line": "cernet",
+      "ttl": 300
+    },
+    {
+      "name": "cdn.example.com",
+      "zone_id": "your_zone_id",
+      "recordset_id": "cloud_a_recordset_id",
+      "type": "A",
+      "line": "cloud",
+      "ttl": 300
+    },
+    {
+      "name": "cdn.example.com",
+      "zone_id": "your_zone_id",
+      "recordset_id": "cloud_aaaa_recordset_id",
+      "type": "AAAA",
+      "line": "cloud",
       "ttl": 300
     }
   ]
