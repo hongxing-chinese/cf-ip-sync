@@ -7,9 +7,8 @@ import shlex
 import shutil
 import subprocess
 import sys
-import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
 from huaweicloudsdkcore.auth.credentials import BasicCredentials
@@ -70,7 +69,8 @@ CFHUB_POOLS_URL = os.environ.get(
     "CFHUB_POOLS_URL", "https://cfhub.1molchuan.top/api/v1/pools"
 )
 CFHUB_MAX_LATENCY_MS = env_int("CFHUB_MAX_LATENCY_MS", 500)
-CFHUB_UPDATE_INTERVAL_SECONDS = env_int("CFHUB_UPDATE_INTERVAL_SECONDS", 300)
+RUN_STATE_FILE = abs_path(os.environ.get("RUN_STATE_FILE", "run_state.json"))
+BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 DNS_ZONE_ID = os.environ.get("DNS_ZONE_ID", "")
 DNS_RECORDSET_ID = os.environ.get("DNS_RECORDSET_ID", "")
@@ -367,8 +367,6 @@ def validate_config():
         raise ValueError("IP_SOURCE 必须是 cfhub 或 cfst")
     if DNS_RECORD_TYPE not in {"A", "AAAA"}:
         raise ValueError("DNS_RECORD_TYPE 必须是 A 或 AAAA")
-    if CFHUB_UPDATE_INTERVAL_SECONDS <= 0:
-        raise ValueError("CFHUB_UPDATE_INTERVAL_SECONDS 必须大于 0")
     if CFHUB_MAX_LATENCY_MS < 0:
         raise ValueError("CFHUB_MAX_LATENCY_MS 不能小于 0")
 
@@ -581,168 +579,282 @@ def update_cfhub_dns_records(records, ips_by_line_type):
 def run_cfhub_cycle(dns_records):
     print(f"\n正在从 CFHub 获取全国 IP 池：{CFHUB_POOLS_URL}")
     ips_by_line_type = fetch_cfhub_ips()
-    selected_rows = [item for items in ips_by_line_type.values() for item in items]
     for (line, record_type), items in sorted(ips_by_line_type.items()):
         details = ", ".join(
             f"{item['ip']} ({item['latency_ms']:g} ms)" for item in items
         )
         print(f"  {line} {record_type}: {details}")
     results = update_cfhub_dns_records(dns_records, ips_by_line_type)
-    failed = any(result["status"] == "失败" for result in results)
-    status = "dry_run" if DRY_RUN else ("failed" if failed else "success")
-    send_feishu_notification(status, selected_rows, results)
-    return 1 if failed else 0
+    return results
 
 
-def run_cfhub_forever(dns_records):
-    print(
-        f"CFHub 自动更新已启动，每 {CFHUB_UPDATE_INTERVAL_SECONDS} 秒获取并同步一次。"
-    )
-    while True:
-        started = time.monotonic()
+def load_run_state():
+    if not os.path.exists(RUN_STATE_FILE):
+        return {"runs": [], "last_daily_report_date": ""}
+    try:
+        with open(RUN_STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        if not isinstance(state, dict) or not isinstance(state.get("runs"), list):
+            raise ValueError("状态文件格式无效")
+        state.setdefault("last_daily_report_date", "")
+        return state
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f"状态文件读取失败，将从空历史继续：{exc}")
+        return {"runs": [], "last_daily_report_date": ""}
+
+
+def save_run_state(state):
+    state_dir = os.path.dirname(RUN_STATE_FILE)
+    os.makedirs(state_dir, exist_ok=True)
+    temporary_path = RUN_STATE_FILE + ".tmp"
+    with open(temporary_path, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(temporary_path, RUN_STATE_FILE)
+
+
+def append_run(state, run):
+    cutoff = datetime.now(BEIJING_TZ) - timedelta(hours=24)
+    runs = state.get("runs", [])
+    recent_runs = []
+    for item in runs:
         try:
-            run_cfhub_cycle(dns_records)
-        except Exception as exc:
-            error = str(exc)
-            print(f"\n本轮 CFHub 同步失败：{error}")
-            send_feishu_notification("failed", [], [], error=error)
-        elapsed = time.monotonic() - started
-        time.sleep(max(0, CFHUB_UPDATE_INTERVAL_SECONDS - elapsed))
+            item_time = datetime.fromisoformat(item["timestamp"])
+            if item_time.tzinfo is None:
+                item_time = item_time.replace(tzinfo=BEIJING_TZ)
+            if item_time >= cutoff:
+                recent_runs.append(item)
+        except (KeyError, TypeError, ValueError):
+            continue
+    recent_runs.append(run)
+    state["runs"] = recent_runs
 
 
-# ================= 飞书通知 =================
-
-
-def send_feishu_notification(status, selected_rows, update_results=None, error=""):
+def send_feishu_message(title, message):
     if not FEISHU_WEBHOOK_URL:
-        print("\n未配置 FEISHU_WEBHOOK_URL_CFST，跳过飞书通知。")
-        return
-
-    ips = [item["ip"] for item in selected_rows]
-    detail_lines = []
-    for item in selected_rows:
-        line = item["ip"]
-        if item.get("latency_ms") not in (None, ""):
-            line += f" | 延迟 {item['latency_ms']} ms"
-        if item.get("speed_mb_s"):
-            line += f" | 速度 {item['speed_mb_s']} MB/s"
-        if item.get("colo"):
-            line += f" | 机房 {item['colo']}"
-        detail_lines.append(line)
-
-    status_text = {
-        "success": "成功",
-        "dry_run": "演练完成",
-        "failed": "失败",
-    }.get(status, status)
-
-    update_results = update_results or []
-    result_lines = []
-    for result in update_results:
-        line = f"{result['status']}：{result['name']} {result['type']}"
-        if result.get("line"):
-            line += f"（{result['line']}）"
-        if result.get("error"):
-            line += f" | {result['error']}"
-        result_lines.append(line)
-
-    content = [
-        [{"tag": "text", "text": f"执行状态：{status_text}\n"}],
-        [{"tag": "text", "text": f"记录数量：{len(update_results)}\n"}],
-        [{"tag": "text", "text": f"优选 IP：{', '.join(ips) if ips else '无'}\n"}],
-        [
-            {
-                "tag": "text",
-                "text": "测速详情：\n" + ("\n".join(detail_lines) if detail_lines else "无"),
-            }
-        ],
-        [
-            {
-                "tag": "text",
-                "text": "\nDNS 同步详情：\n" + ("\n".join(result_lines) if result_lines else "无"),
-            }
-        ],
-        [{"tag": "text", "text": f"\n执行时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"}],
-    ]
-
-    if error:
-        content.append([{"tag": "text", "text": f"\n错误信息：{error}"}])
+        print("未配置 FEISHU_WEBHOOK_URL_CFST，跳过飞书通知。")
+        return False
 
     payload = {
         "msg_type": "post",
         "content": {
             "post": {
                 "zh_cn": {
-                    "title": "Cloudflare 优选 IP DNS 更新",
-                    "content": content,
+                    "title": title,
+                    "content": [[{"tag": "text", "text": message}]],
                 }
             }
         },
     }
+    request = urllib.request.Request(
+        FEISHU_WEBHOOK_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        if result.get("code") == 0:
+            print(f"飞书通知已发送：{title}")
+            return True
+        print(f"飞书通知发送失败：{result}")
+    except Exception as exc:
+        print(f"飞书通知发送异常：{exc}")
+    return False
 
-    max_retries = 5
-    retry_delay = 120
 
-    for attempt in range(1, max_retries + 1):
+def build_daily_report(state, now):
+    cutoff = now - timedelta(hours=24)
+    runs = []
+    for run in state.get("runs", []):
         try:
-            req = urllib.request.Request(
-                FEISHU_WEBHOOK_URL,
-                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
+            run_time = datetime.fromisoformat(run["timestamp"])
+            if run_time.tzinfo is None:
+                run_time = run_time.replace(tzinfo=BEIJING_TZ)
+            if run_time >= cutoff:
+                runs.append(run)
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    success_count = sum(run.get("status") == "success" for run in runs)
+    failure_count = sum(run.get("status") == "failed" for run in runs)
+    dry_run_count = sum(run.get("status") == "dry_run" for run in runs)
+    updated_count = sum(run.get("records_updated", 0) for run in runs)
+    skipped_count = sum(run.get("records_skipped", 0) for run in runs)
+    failed_record_count = sum(run.get("records_failed", 0) for run in runs)
+    sources = sorted({run.get("source", "unknown") for run in runs})
+    source_summary = "，".join(
+        f"{source} {sum(run.get('source') == source for run in runs)} 次"
+        for source in sources
+    ) if sources else "无"
+
+    lines = [
+        f"统计区间：{cutoff.strftime('%Y-%m-%d %H:%M')} 至 {now.strftime('%Y-%m-%d %H:%M')}（北京时间）",
+        f"运行次数：{len(runs)}（成功 {success_count}，失败 {failure_count}，演练 {dry_run_count}）",
+        f"数据来源：{source_summary}",
+        f"DNS 记录处理：更新 {updated_count}，无匹配 IP 跳过 {skipped_count}，更新失败 {failed_record_count}",
+    ]
+    if runs:
+        latest = runs[-1]
+        lines.append(
+            f"最近运行：{latest['timestamp']}，状态={latest['status']}"
+        )
+
+    failures = [run for run in runs if run.get("status") == "failed"]
+    if failures:
+        lines.append("失败明细：")
+        for run in failures[-5:]:
+            detail = run.get("error") or "；".join(run.get("failed_records", [])) or "记录更新失败"
+            lines.append(f"- {run['timestamp']}：{detail}")
+    else:
+        lines.append("失败明细：无")
+    return "\n".join(lines)
+
+
+def maybe_send_daily_report(state, now):
+    if not FEISHU_WEBHOOK_URL:
+        return
+    report_date = now.date().isoformat()
+    if now.hour < 15 or state.get("last_daily_report_date") == report_date:
+        return
+
+    message = build_daily_report(state, now)
+    if send_feishu_message("Cloudflare DNS 过去 24 小时运行汇总", message):
+        state["last_daily_report_date"] = report_date
+        save_run_state(state)
+
+
+def run_cfhub_once(dns_records):
+    now = datetime.now(BEIJING_TZ)
+    state = load_run_state()
+    run = {
+        "timestamp": now.isoformat(timespec="seconds"),
+        "source": "cfhub",
+        "status": "success",
+        "records_updated": 0,
+        "records_skipped": 0,
+        "records_failed": 0,
+        "failed_records": [],
+        "error": "",
+    }
+    try:
+        results = run_cfhub_cycle(dns_records)
+        failed_results = [item for item in results if item["status"] == "失败"]
+        run["records_updated"] = sum(item["status"] == "成功" for item in results)
+        run["records_skipped"] = sum(item["status"] == "跳过" for item in results)
+        run["records_failed"] = len(failed_results)
+        run["failed_records"] = [
+            f"{item['name']} {item['type']}（{item.get('line', '')}）：{item.get('error', '')}"
+            for item in failed_results
+        ]
+        if failed_results:
+            run["status"] = "failed"
+            failure_lines = "\n".join(f"- {item}" for item in run["failed_records"])
+            send_feishu_message(
+                "Cloudflare DNS 更新失败",
+                f"时间：{now.strftime('%Y-%m-%d %H:%M:%S')}（北京时间）\n{failure_lines}",
             )
-            response = urllib.request.urlopen(req, timeout=10)
-            resp_data = json.loads(response.read().decode("utf-8"))
+        elif DRY_RUN:
+            run["status"] = "dry_run"
+    except Exception as exc:
+        run["status"] = "failed"
+        run["error"] = str(exc)
+        print(f"\nCFHub 同步失败：{exc}")
+        send_feishu_message(
+            "Cloudflare DNS 更新失败",
+            f"时间：{now.strftime('%Y-%m-%d %H:%M:%S')}（北京时间）\n错误：{exc}",
+        )
 
-            if resp_data.get("code") == 0:
-                print("\n飞书通知发送成功。")
-                return
+    append_run(state, run)
+    save_run_state(state)
+    maybe_send_daily_report(state, datetime.now(BEIJING_TZ))
+    return 1 if run["status"] == "failed" else 0
 
-            if resp_data.get("code") == 11232 and attempt < max_retries:
-                print(
-                    f"\n飞书触发频率限制，当前第 {attempt}/{max_retries} 次，"
-                    f"{retry_delay} 秒后重试..."
-                )
-                time.sleep(retry_delay)
-                continue
 
-            print(f"\n飞书通知发送失败：{resp_data}")
-            return
-        except Exception as exc:
-            print(f"\n飞书通知发送异常（{attempt}/{max_retries}）：{exc}")
-            if attempt < max_retries:
-                time.sleep(retry_delay)
+def run_cfst_once(dns_records):
+    now = datetime.now(BEIJING_TZ)
+    state = load_run_state()
+    run = {
+        "timestamp": now.isoformat(timespec="seconds"),
+        "source": "cfst",
+        "status": "success",
+        "records_updated": 0,
+        "records_skipped": 0,
+        "records_failed": 0,
+        "failed_records": [],
+        "error": "",
+    }
+    try:
+        selected_rows = run_cfst()
+        results = update_huawei_dns_records(dns_records, [item["ip"] for item in selected_rows])
+        failed_results = [item for item in results if item["status"] == "失败"]
+        run["records_updated"] = sum(item["status"] == "成功" for item in results)
+        run["records_failed"] = len(failed_results)
+        run["failed_records"] = [
+            f"{item['name']} {item['type']}：{item.get('error', '')}"
+            for item in failed_results
+        ]
+        if failed_results:
+            run["status"] = "failed"
+            send_feishu_message(
+                "Cloudflare DNS 更新失败",
+                f"时间：{now.strftime('%Y-%m-%d %H:%M:%S')}（北京时间）\n"
+                + "\n".join(f"- {item}" for item in run["failed_records"]),
+            )
+        elif DRY_RUN:
+            run["status"] = "dry_run"
+    except Exception as exc:
+        run["status"] = "failed"
+        run["error"] = str(exc)
+        print(f"\nCloudflareSpeedTest 更新失败：{exc}")
+        send_feishu_message(
+            "Cloudflare DNS 更新失败",
+            f"时间：{now.strftime('%Y-%m-%d %H:%M:%S')}（北京时间）\n错误：{exc}",
+        )
+
+    append_run(state, run)
+    save_run_state(state)
+    maybe_send_daily_report(state, datetime.now(BEIJING_TZ))
+    return 1 if run["status"] == "failed" else 0
 
 
 # ================= 入口 =================
 
 
 def main():
-    selected_rows = []
-    update_results = []
     try:
         dns_records = validate_config()
         if IP_SOURCE == "cfhub":
-            run_cfhub_forever(dns_records)
-            return 0
+            return run_cfhub_once(dns_records)
 
         dns_records = [record for record in dns_records if record["type"] == DNS_RECORD_TYPE]
         if not dns_records:
             raise ValueError(
                 f"配置文件中没有 type={DNS_RECORD_TYPE} 的 DNS 记录，无法写入本地测速结果。"
             )
-        selected_rows = run_cfst()
-        ips = [item["ip"] for item in selected_rows]
-        update_results = update_huawei_dns_records(dns_records, ips)
-
-        has_failed = any(result["status"] == "失败" for result in update_results)
-        status = "dry_run" if DRY_RUN else ("failed" if has_failed else "success")
-        send_feishu_notification(status, selected_rows, update_results)
-        return 1 if has_failed else 0
+        return run_cfst_once(dns_records)
     except Exception as exc:
         error = str(exc)
         print(f"\n错误：{error}")
-        send_feishu_notification("failed", selected_rows, update_results, error=error)
+        now = datetime.now(BEIJING_TZ)
+        state = load_run_state()
+        run = {
+            "timestamp": now.isoformat(timespec="seconds"),
+            "source": IP_SOURCE,
+            "status": "failed",
+            "records_updated": 0,
+            "records_skipped": 0,
+            "records_failed": 0,
+            "failed_records": [],
+            "error": error,
+        }
+        append_run(state, run)
+        save_run_state(state)
+        send_feishu_message(
+            "Cloudflare DNS 更新失败",
+            f"时间：{now.strftime('%Y-%m-%d %H:%M:%S')}（北京时间）\n错误：{error}",
+        )
+        maybe_send_daily_report(state, datetime.now(BEIJING_TZ))
         return 1
 
 

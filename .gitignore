@@ -6,3 +6,5 @@ __pycache__/
 cfst_result.csv
 result.csv
 dns_records.json
+run_state.json
+run_state.json.tmp
