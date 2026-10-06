@@ -1,12 +1,12 @@
 # Cloudflare 优选 IP 华为云 DNS 同步
 
-本项目支持 CFHub 和本地 CloudflareSpeedTest 两种 IP 来源。默认使用 CFHub 全国池，筛选 `median_ms <= 500` 的 IPv4/IPv6 地址，并按线路更新华为云 DNS。每次脚本单轮同步后退出，由 cron 每 5 分钟启动一次。本地测速通过 `IP_SOURCE=cfst` 启用，Windows 和 Linux 均保留支持。
+本项目支持 CFHub 和本地 CloudflareSpeedTest 两种 IP 来源。默认从 CFHub 全国池优先选取各线路 IP；移动、电信、教育网和全网默认阈值为 `median_ms <= 500`，联通为 `<= 900`。若某条线路没有合格全国池地址，则回退到对应运营商池，取延迟最低的最多两条。CFHub 每次脚本单轮同步后退出，由 cron 每 5 分钟启动一次。本地测速通过 `IP_SOURCE=cfst` 启用，Windows 和 Linux 均保留支持。
 
 程序只更新华为云上预先创建的记录集，不创建或删除记录。某条线路没有匹配 IP 时会跳过并保留旧值；跳过不算失败。
 
 ## 线路映射
 
-CFHub `lines` 映射为：`cmcc`（移动）、`chinanet`（电信）、`unicom`（联通）、`cernet`（教育网）、`cloud`（全网默认）。IPv4 更新 `A`，IPv6 更新 `AAAA`。一个 IP 的 `lines` 包含多个值时，会分别写入这些线路；同一线路内的重复 IP 会去重。
+CFHub `lines` 映射为：`cmcc`（移动）、`chinanet`（电信）、`unicom`（联通）、`cernet`（教育网）、`cloud`（全网默认）。IPv4 更新 `A`，IPv6 更新 `AAAA`。一个 IP 的 `lines` 包含多个值时，会分别写入这些线路；同一线路内的重复 IP 会去重。只有该线路和地址族没有达到 national 阈值的地址时才会使用专属池；专属池不再应用 500/900ms 阈值。
 
 ## 安装与配置
 
@@ -37,7 +37,6 @@ HUAWEI_AK=你的AccessKey
 HUAWEI_SK=你的SecretKey
 HUAWEI_REGION=cn-east-3
 IP_SOURCE=cfhub
-CFHUB_MAX_LATENCY_MS=500
 RUN_STATE_FILE=run_state.json
 DRY_RUN=true
 ```
@@ -100,7 +99,7 @@ tail -f /home/cf-ip-sync/run.log
 在 `.env` 配置 `FEISHU_WEBHOOK_URL_CFST` 启用通知。CFHub 模式：
 
 - 成功更新和无匹配 IP 的跳过不发送即时通知。
-- CFHub API、配置或华为云 DNS 更新失败时，该轮发送一次失败通知。
+- 所有已配置线路/地址族在 national 和对应专属池中都找不到可更新 IP 时，或华为云 DNS 更新失败时，该轮发送一次失败通知。若部分记录可更新、部分线路无 IP，则更新可用记录并跳过其余记录，不发送失败通知。
 - 每天北京时间 15:00 后首次运行时，发送过去 24 小时汇总，内容包含运行次数、成功/失败次数、DNS 更新/跳过/失败数量及失败明细。cron 每 5 分钟运行，通常在 15:00 那轮发送。
 
 运行历史存储于 `RUN_STATE_FILE`（默认 `run_state.json`），包含 CFHub 和本地 CFST 运行，且已加入 `.gitignore`。状态文件保留滚动 24 小时记录；不要在统计周期内删除它，否则汇总历史会丢失。
@@ -111,7 +110,6 @@ tail -f /home/cf-ip-sync/run.log
 |---|---|---|
 | `IP_SOURCE` | `cfhub` | `cfhub` 单轮更新后退出；`cfst` 本地测速后退出。 |
 | `CFHUB_POOLS_URL` | `https://cfhub.1molchuan.top/api/v1/pools` | CFHub API 地址。 |
-| `CFHUB_MAX_LATENCY_MS` | `500` | 全国池 IP 的最大 `median_ms`，包含等于阈值的 IP。 |
 | `RUN_STATE_FILE` | `run_state.json` | CFHub/CFST 运行历史及每日汇总状态。 |
 | `HUAWEI_AK` / `HUAWEI_SK` | 空 | 正式更新时必填的华为云 API 凭证。 |
 | `HUAWEI_REGION` | `ap-southeast-1` | 华为云 DNS 服务区域。 |

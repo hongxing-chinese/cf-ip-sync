@@ -1,6 +1,7 @@
 import csv
 import ipaddress
 import json
+import math
 import os
 import platform
 import shlex
@@ -68,7 +69,8 @@ IP_SOURCE = os.environ.get("IP_SOURCE", "cfhub").strip().lower()
 CFHUB_POOLS_URL = os.environ.get(
     "CFHUB_POOLS_URL", "https://cfhub.1molchuan.top/api/v1/pools"
 )
-CFHUB_MAX_LATENCY_MS = env_int("CFHUB_MAX_LATENCY_MS", 500)
+CFHUB_MAX_LATENCY_MS = 500
+CFHUB_UNICOM_MAX_LATENCY_MS = 900
 RUN_STATE_FILE = abs_path(os.environ.get("RUN_STATE_FILE", "run_state.json"))
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
@@ -367,9 +369,6 @@ def validate_config():
         raise ValueError("IP_SOURCE 必须是 cfhub 或 cfst")
     if DNS_RECORD_TYPE not in {"A", "AAAA"}:
         raise ValueError("DNS_RECORD_TYPE 必须是 A 或 AAAA")
-    if CFHUB_MAX_LATENCY_MS < 0:
-        raise ValueError("CFHUB_MAX_LATENCY_MS 不能小于 0")
-
     if missing and not DRY_RUN:
         raise ValueError("缺少必要的环境变量：" + ", ".join(missing))
 
@@ -453,7 +452,7 @@ def update_huawei_dns_records(records, ips):
 # ================= CFHub 数据源 =================
 
 
-def fetch_cfhub_ips():
+def fetch_cfhub_ips(records):
     request = urllib.request.Request(
         CFHUB_POOLS_URL, headers={"User-Agent": "cf-ip-sync/1.0"}
     )
@@ -465,11 +464,19 @@ def fetch_cfhub_ips():
         raise ValueError("CFHub API 响应缺少 pools 数组。")
 
     selected = {}
-    supported_lines = set(CFHUB_LINES.values())
+    pools_by_isp = {}
+    configured_keys = {
+        (record["cfhub_line"], record["type"])
+        for record in records
+    }
+    isp_lines = set(CFHUB_LINES.values())
     for pool in pools:
-        if not isinstance(pool, dict) or pool.get("isp") != "national":
+        if not isinstance(pool, dict):
             continue
         if pool.get("published") is False:
+            continue
+        isp = pool.get("isp")
+        if isp not in isp_lines and isp != "national":
             continue
         entries = pool.get("ips", [])
         if not isinstance(entries, list):
@@ -482,28 +489,62 @@ def fetch_cfhub_ips():
                 ip_obj = ipaddress.ip_address(str(entry.get("ip", "")).strip())
             except (TypeError, ValueError):
                 continue
-            if latency > CFHUB_MAX_LATENCY_MS:
+            if not math.isfinite(latency) or latency < 0:
                 continue
             record_type = "A" if ip_obj.version == 4 else "AAAA"
-            lines = entry.get("lines", [])
-            if not isinstance(lines, list):
-                continue
-            for line in lines:
-                if line not in supported_lines:
+            item = {
+                "ip": str(ip_obj),
+                "latency_ms": latency,
+                "votes": entry.get("votes", ""),
+                "users": entry.get("users", ""),
+                "source_pool": isp,
+            }
+            if isp == "national":
+                lines = entry.get("lines", [])
+                if not isinstance(lines, list):
                     continue
-                key = (line, record_type)
-                selected.setdefault(key, {})[str(ip_obj)] = {
-                    "ip": str(ip_obj),
-                    "latency_ms": latency,
-                    "votes": entry.get("votes", ""),
-                    "users": entry.get("users", ""),
-                    "lines": lines,
-                }
+                for line in lines:
+                    if not isinstance(line, str) or line not in isp_lines:
+                        continue
+                    key = (line, record_type)
+                    max_latency = (
+                        CFHUB_UNICOM_MAX_LATENCY_MS
+                        if line == "unicom"
+                        else CFHUB_MAX_LATENCY_MS
+                    )
+                    if (
+                        key in configured_keys
+                        and latency <= max_latency
+                    ):
+                        candidates = selected.setdefault(key, {})
+                        previous = candidates.get(str(ip_obj))
+                        if previous is None or latency < previous["latency_ms"]:
+                            candidates[str(ip_obj)] = item
+            else:
+                key = (isp, record_type)
+                if key in configured_keys:
+                    candidates = pools_by_isp.setdefault(key, {})
+                    previous = candidates.get(str(ip_obj))
+                    if previous is None or latency < previous["latency_ms"]:
+                        candidates[str(ip_obj)] = item
 
-    result = {key: list(items.values()) for key, items in selected.items()}
+    # 全国池优先；某条线路或地址族没有符合阈值的全国 IP 时，
+    # 改从同 ISP 的专属池取延迟最低的两条，不受全国池阈值限制。
+    for key in configured_keys:
+        if selected.get(key):
+            continue
+        candidates = list(pools_by_isp.get(key, {}).values())
+        candidates.sort(key=lambda item: (item["latency_ms"], item["ip"]))
+        if candidates:
+            selected[key] = {
+                item["ip"]: item
+                for item in candidates[:2]
+            }
+
+    result = {key: list(items.values()) for key, items in selected.items() if items}
     if not result:
         raise RuntimeError(
-            f"CFHub national 池中没有 median_ms <= {CFHUB_MAX_LATENCY_MS} 的有效 IP。"
+            "CFHub 全国池及各线路专属池中均没有可用于已配置 DNS 记录的有效 IP。"
         )
     return result
 
@@ -518,7 +559,7 @@ def update_cfhub_dns_records(records, ips_by_line_type):
         if not ips:
             print(
                 f"  跳过：{record['name']} {record['type']} "
-                f"线路={record['cfhub_line']}，CFHub 当前没有符合条件的 IP；保留现有解析。"
+                f"线路={record['cfhub_line']}，national 及专属池均无匹配 IP；保留现有解析。"
             )
             results.append(
                 {
@@ -534,14 +575,16 @@ def update_cfhub_dns_records(records, ips_by_line_type):
         print("\nDRY_RUN=true，跳过华为云 DNS 更新：")
         for record, items in applicable:
             ips = [item["ip"] for item in items]
+            source_pool = items[0]["source_pool"]
             print(
                 f"  演练：{record['name']} {record['type']} "
-                f"线路={record['cfhub_line']} -> {ips}"
+                f"线路={record['cfhub_line']} 池={source_pool} -> {ips}"
             )
             results.append(
                 {
                     "name": record["name"], "type": record["type"],
                     "line": record["cfhub_line"],
+                    "source_pool": source_pool,
                     "status": "演练", "records": ips, "error": "",
                 }
             )
@@ -560,6 +603,7 @@ def update_cfhub_dns_records(records, ips_by_line_type):
         try:
             result = update_single_huawei_dns(client, record, ips)
             result["line"] = record["cfhub_line"]
+            result["source_pool"] = items[0]["source_pool"]
             results.append(result)
         except Exception as exc:
             error = str(exc)
@@ -570,6 +614,8 @@ def update_cfhub_dns_records(records, ips_by_line_type):
             results.append(
                 {
                     "name": record["name"], "type": record["type"],
+                    "line": record["cfhub_line"],
+                    "source_pool": items[0]["source_pool"],
                     "status": "失败", "records": ips, "error": error,
                 }
             )
@@ -578,12 +624,14 @@ def update_cfhub_dns_records(records, ips_by_line_type):
 
 def run_cfhub_cycle(dns_records):
     print(f"\n正在从 CFHub 获取全国 IP 池：{CFHUB_POOLS_URL}")
-    ips_by_line_type = fetch_cfhub_ips()
+    ips_by_line_type = fetch_cfhub_ips(dns_records)
     for (line, record_type), items in sorted(ips_by_line_type.items()):
         details = ", ".join(
             f"{item['ip']} ({item['latency_ms']:g} ms)" for item in items
         )
-        print(f"  {line} {record_type}: {details}")
+        pool = items[0]["source_pool"]
+        pool_note = "（运营商专属池回退）" if pool != "national" else ""
+        print(f"  {line} {record_type}{pool_note}: {details}")
     results = update_cfhub_dns_records(dns_records, ips_by_line_type)
     return results
 
@@ -682,6 +730,7 @@ def build_daily_report(state, now):
     updated_count = sum(run.get("records_updated", 0) for run in runs)
     skipped_count = sum(run.get("records_skipped", 0) for run in runs)
     failed_record_count = sum(run.get("records_failed", 0) for run in runs)
+    fallback_count = sum(run.get("records_fallback", 0) for run in runs)
     sources = sorted({run.get("source", "unknown") for run in runs})
     source_summary = "，".join(
         f"{source} {sum(run.get('source') == source for run in runs)} 次"
@@ -692,7 +741,7 @@ def build_daily_report(state, now):
         f"统计区间：{cutoff.strftime('%Y-%m-%d %H:%M')} 至 {now.strftime('%Y-%m-%d %H:%M')}（北京时间）",
         f"运行次数：{len(runs)}（成功 {success_count}，失败 {failure_count}，演练 {dry_run_count}）",
         f"数据来源：{source_summary}",
-        f"DNS 记录处理：更新 {updated_count}，无匹配 IP 跳过 {skipped_count}，更新失败 {failed_record_count}",
+        f"DNS 记录处理：更新 {updated_count}，专属池回退 {fallback_count}，无匹配 IP 跳过 {skipped_count}，更新失败 {failed_record_count}",
     ]
     if runs:
         latest = runs[-1]
@@ -732,6 +781,7 @@ def run_cfhub_once(dns_records):
         "source": "cfhub",
         "status": "success",
         "records_updated": 0,
+        "records_fallback": 0,
         "records_skipped": 0,
         "records_failed": 0,
         "failed_records": [],
@@ -741,6 +791,11 @@ def run_cfhub_once(dns_records):
         results = run_cfhub_cycle(dns_records)
         failed_results = [item for item in results if item["status"] == "失败"]
         run["records_updated"] = sum(item["status"] == "成功" for item in results)
+        run["records_fallback"] = sum(
+            item["status"] in {"成功", "演练"}
+            and item.get("source_pool") != "national"
+            for item in results
+        )
         run["records_skipped"] = sum(item["status"] == "跳过" for item in results)
         run["records_failed"] = len(failed_results)
         run["failed_records"] = [
@@ -779,6 +834,7 @@ def run_cfst_once(dns_records):
         "source": "cfst",
         "status": "success",
         "records_updated": 0,
+        "records_fallback": 0,
         "records_skipped": 0,
         "records_failed": 0,
         "failed_records": [],
@@ -843,6 +899,7 @@ def main():
             "source": IP_SOURCE,
             "status": "failed",
             "records_updated": 0,
+            "records_fallback": 0,
             "records_skipped": 0,
             "records_failed": 0,
             "failed_records": [],
